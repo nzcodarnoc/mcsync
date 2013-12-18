@@ -1,0 +1,1 @@
+Improve error handling, at present if a contact throws an error it must be resolved manually.
