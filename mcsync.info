@@ -1,0 +1,8 @@
+name = Mailchimp CiviCRM syncronisation
+description = One way syncronisation from CiviCRM to Mailchimp
+core = 7.x
+package = Museums Aotearoa
+php = 5.3
+version = 1.0
+dependencies[] = ma
+files[] = mailchimp_api/Mailchimp.php

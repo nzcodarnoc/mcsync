@@ -1,0 +1,23 @@
+<?php
+
+function mcsync_schema()
+{
+  $schema['mcsync'] = array(
+    'description' => 'Store metadata about syncronisation',
+    'fields' => array(
+      'cid' => array(
+        'description' => 'The contact ID, this matches CiviCRM contact',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'metadata' => array(
+        'description' => 'Serialised metadata related to a contact',
+        'type' => 'blob',
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('cid'),
+  );
+  return $schema;
+}

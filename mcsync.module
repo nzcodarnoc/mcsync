@@ -1,0 +1,364 @@
+<?php
+
+function mcsync_menu()
+{
+  $items['admin/config/civicrm/mcsync'] = array(
+      'title' => "Syncronise CiviCRM to Mailchimp",
+      'description' => "Manually run the CiviCRM to Mailchimp synchronisation",
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('mcsync_step1_form'),
+      'access arguments' => array('access administration pages'),
+      'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/config/civicrm/mcsync/run'] = array(
+        'title' => 'Run sync',
+        'type' => MENU_DEFAULT_LOCAL_TASK,
+        'weight' => 0,
+  );
+
+  $items['admin/config/civicrm/mcsync/settings'] = array(
+      'title' => "Settings",
+      'description' => "Settings for CiviCRM to MailChimp synchronisation",
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('mcsync_settings'),
+      'access arguments' => array('access administration pages'),
+      'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+
+
+function mcsync_settings()
+{
+  $vars = array(
+    'mcsync_api_key' => array(
+      'name' => 'Mailchimp API key',
+      'description' => 'User name > Account Settings > Extras > API keys',
+    ),
+    'mcsync_list_id' => array(
+      'name' => 'The list ID in Mailchimp to synchronise to',
+      'description' => 'Lists > List name > Settings > List name & defaults',
+    ),
+    'mcsync_groups_id' => array(
+      'name' => 'The ID of the <em>Your interests</em> group',
+      'description' => 'Get value with the API'
+    ),
+  );
+  $form = array();
+  foreach ($vars as $k => $v)
+  {
+    $form[$k] = array(
+        '#type' => 'textfield',
+        '#title' => $v['name'],
+        '#description' => $v['description'],
+        '#default_value' => variable_get($k, ''),
+        '#required' => true,
+    );
+  }
+  return system_settings_form($form);
+}
+
+
+
+function mcsync_step1_form()
+{
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'Run synchronisation',
+  );
+  return $form;
+}
+
+
+
+function mcsync_step1_form_submit(&$form, &$form_submit)
+{
+  civicrm_initialize();
+  $lists = mcsync_get_lists_api();
+  $list_id = variable_get('mcsync_list_id');
+  $groups_id = variable_get('mcsync_groups_id');
+
+  mcsync_groups($lists, $list_id, $groups_id);
+
+  mcsync_contacts($lists, $list_id, $groups_id);
+}
+
+function mcsync_get_lists_api()
+{
+ $mailchimp = new Mailchimp(variable_get("mcsync_api_key"));
+ return new Mailchimp_Lists($mailchimp);
+}
+
+function mcsync_contacts($lists, $list_id, $groups_id)
+{
+  $record_seperator = "[[[%seperator%]]]";
+  $queries[] = mcsync_get_group_query($record_seperator);
+  $queries[] = mcsync_get_smart_group_query($record_seperator);
+  $batch = array();
+  foreach ($queries as $query)
+  {
+    $dao_contact = &CRM_Core_DAO::executeQuery($query);
+
+    // Structure the data for the Mailchimp API
+    while($dao_contact->fetch() )
+    {
+      // Merge groups
+      $groups = explode($record_seperator,$dao_contact->group_list);
+      if (isset($batch[$dao_contact->cid]))
+      {
+        $groups = array_merge($groups, $batch[$dao_contact->cid]["merge_vars"]["groupings"][0]["groups"]);
+      }
+      $batch[$dao_contact->cid] = array(
+        'email' => array(
+          'email' => $dao_contact->email,
+        ),
+        'merge_vars' => array(
+          'fname' => $dao_contact->first_name,
+          'lname' => $dao_contact->last_name,
+          'groupings' => array(
+            0 => array(
+              'id' => $groups_id,
+              'groups' => $groups,
+            )
+          )
+        ),
+        '#metadata' => array(
+          'cid' => $dao_contact->cid,
+          'is_deleted' => $dao_contact->is_deleted,
+          'do_not_email' => $dao_contact->do_not_email,
+          'on_hold' => $dao_contact->on_hold,
+        )
+      );
+    }
+    unset($dao_contact);
+  }
+  dpm($batch);
+  $ops = array();
+  foreach($batch as $contact)
+  {
+    $op = "skip";
+
+    $dao_metadata = &CRM_Core_DAO::executeQuery("
+      SELECT cid, metadata FROM mcsync where cid={$contact['#metadata']['cid']}
+    ");
+    if ($dao_metadata->N == 0)
+    {
+      if($contact['#metadata']['is_deleted'] == 0 &&
+        $contact['#metadata']['do_not_email'] == 0 &&
+        $contact['#metadata']['on_hold'] == 0
+      )
+      {
+        $op = "add";
+      }
+    }
+    else
+    {
+      $dao_metadata->fetch();
+      $blob = unserialize($dao_metadata->metadata);
+      $g1 = $blob['merge_vars']['groupings'][0]['groups'];
+      $g2 = $contact['merge_vars']['groupings'][0]['groups'] ;
+      if (
+        $blob['email']['email']            != $contact['email']['email'] ||
+        $blob['#metadata']['is_deleted']   != $contact['#metadata']['is_deleted'] ||
+        $blob['#metadata']['do_not_email'] != $contact['#metadata']['do_not_email'] ||
+        $blob['#metadata']['on_hold']      != $contact['#metadata']['on_hold'] ||
+        (sizeof(array_diff($g1, $g2)) && sizeof(array_diff($g2, $g1)))
+      )
+      {
+        $op = "update";
+        $contact['merge_vars']['new-email'] = $contact['email']['email'];
+        if(
+          $contact['#metadata']['is_deleted'] == 1 ||
+          $contact['#metadata']['do_not_email'] == 1 ||
+          $contact['#metadata']['on_hold'] == 1
+        )
+        {
+          $op = "delete";
+        }
+      }
+    }
+
+    if ($op != "skip")
+    {
+      $ops[] = array("mcsync_batch_op", array($op, $blob, $contact, $list_id));
+    }
+  }
+  if (sizeof($ops))
+  {
+    batch_set(array(
+        'operations' => $ops,
+      ));
+  }
+}
+
+function mcsync_batch_op($op, $blob, $contact, $list_id, &$context)
+{
+  $context["message"] = "<h2>CiviCRM action</h2>";
+  $context["message"] .= "<pre>{$op} {$contact['email']['email']}</pre>";
+  $context["message"] .= "<h2>Reply from MailChimp</h2>";
+
+  $lists = mcsync_get_lists_api();
+  $merge_vars = $contact['merge_vars'];
+  switch($op)
+  {
+    case 'add':
+      try
+      {
+        $result = $lists->subscribe($list_id, array('email' => $contact['email']['email']), $merge_vars, 'html', false, true, true, false);
+      }
+      catch (Exception $e)
+      {
+        drupal_set_message($e->getMessage(), "error");
+        $context["message"] .= "<pre>".$e->getMessage()."</pre>";
+      }
+      break;
+    case 'update':
+      try
+      {
+        $result = $lists->updateMember($list_id, array('email' => $blob['email']['email']), $merge_vars, 'html', true);
+      }
+      catch (Exception $e)
+      {
+        drupal_set_message($e->getMessage(), "error");
+        $context["message"] .= "<pre>".$e->getMessage()."</pre>";
+      }
+      break;
+    case 'delete':
+      try
+      {
+        $result = $lists->unsubscribe($list_id, array('email' => $contact['email']['email']), true, false, false);
+      }
+      catch (Exception $e)
+      {
+        drupal_set_message($e->getMessage(), "error");
+        $context["message"] .= "<pre>".$e->getMessage()."</pre>";
+      }
+      break;
+  }
+  $context["message"] .= "<pre>".print_r($result,1)."</pre>";
+  // Update metadata
+  switch($op)
+  {
+    case 'update':
+    case 'add':
+      $new_blob = serialize($contact);
+      db_query("
+        INSERT INTO mcsync VALUES (:cid, :new_blob)
+        ON DUPLICATE KEY UPDATE metadata = :new_blob
+      ", array(
+        ":cid" => $contact['#metadata']['cid'],
+        ":new_blob" => $new_blob,
+      ));
+      break;
+    case 'delete':
+      db_query("
+        DELETE FROM mcsync WHERE cid = :cid
+      ", array(
+        ":cid" => $contact['#metadata']['cid'],
+      ));
+      break;
+  }
+}
+
+function mcsync_groups($lists, $list_id, $groups_id)
+{
+  $interest = array();
+  $mailing_list = array();
+
+  // CiviCRM groups
+  $dao_groups = &CRM_Core_DAO::executeQuery("
+    SELECT id, name, title
+    FROM civicrm_group
+    WHERE (group_type = '2' OR group_type = '12') AND is_active = '1'
+  ");
+  while ($dao_groups->fetch())
+  {
+    $mailing_list[] = $dao_groups->title;
+  }
+
+  // Mailchimp groups
+  $mc_groups = $lists->interestGroupings($list_id);
+  foreach($mc_groups as $groups)
+  {
+    if($groups['id'] == $groups_id)
+    {
+      foreach($groups['groups'] as $group)
+        {
+          $interest[] = $group['name'];
+        }
+    }
+  }
+
+  // Sync
+  $to_create = array_diff($mailing_list, $interest);
+  $to_remove = array_diff($interest, $mailing_list);
+  foreach($to_remove as $group_name)
+  {
+    $lists->interestGroupDel($list_id, $group_name, $groups_id);
+  }
+  foreach($to_create as $group_name)
+  {
+    $lists->interestGroupAdd($list_id, $group_name, $groups_id);
+  }
+}
+
+function mcsync_get_group_query($record_seperator)
+{
+  return "
+  SELECT
+    civicrm_contact.id as cid,
+    civicrm_contact.contact_type,
+    civicrm_contact.first_name,
+    civicrm_contact.last_name,
+    civicrm_contact.do_not_email,
+    civicrm_contact.is_deleted,
+    civicrm_email.on_hold,
+    civicrm_email.email,
+    GROUP_CONCAT(DISTINCT civicrm_group.title SEPARATOR '{$record_seperator}') group_list
+  FROM civicrm_group_contact
+  LEFT JOIN civicrm_contact ON civicrm_contact.id = civicrm_group_contact.contact_id
+  LEFT JOIN civicrm_email ON civicrm_email.contact_id = civicrm_contact.id AND civicrm_email.is_primary = 1
+  LEFT JOIN civicrm_group ON civicrm_group.id = civicrm_group_contact.group_id AND civicrm_group_contact.status = 'Added'
+  LEFT JOIN civicrm_group_contact_cache ON civicrm_group.id = civicrm_group_contact_cache.group_id
+  WHERE
+    civicrm_email.email IS NOT NULL
+    AND (civicrm_group.group_type = '2' OR civicrm_group.group_type = '12')
+    AND civicrm_group.is_active = '1'
+  GROUP BY civicrm_group_contact.contact_id
+  ";
+}
+
+function mcsync_get_smart_group_query($record_seperator)
+{
+  return "
+  SELECT
+    civicrm_contact.id as cid,
+    civicrm_contact.contact_type,
+    civicrm_contact.first_name,
+    civicrm_contact.last_name,
+    civicrm_contact.do_not_email,
+    civicrm_contact.is_deleted,
+    civicrm_email.on_hold,
+    civicrm_email.email,
+    GROUP_CONCAT(DISTINCT civicrm_group.title SEPARATOR '{$record_seperator}') group_list
+  FROM
+    civicrm_group_contact_cache cc
+  LEFT JOIN
+    civicrm_contact
+    ON civicrm_contact.id = cc.contact_id
+  LEFT JOIN
+    civicrm_email
+    ON civicrm_email.contact_id = civicrm_contact.id AND civicrm_email.is_primary = 1
+  LEFT JOIN
+    civicrm_group
+    ON civicrm_group.id = cc.group_id
+  WHERE
+    civicrm_email.email IS NOT NULL
+    AND (civicrm_group.group_type = '2' OR civicrm_group.group_type = '12')
+    AND civicrm_group.is_active = '1'
+  GROUP BY cc.contact_id
+  ";
+}
+
