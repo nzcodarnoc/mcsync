@@ -134,7 +134,7 @@ function mcsync_contacts($lists, $list_id, $groups_id)
     }
     unset($dao_contact);
   }
-  dpm($batch);
+
   $ops = array();
   foreach($batch as $contact)
   {
@@ -169,6 +169,7 @@ function mcsync_contacts($lists, $list_id, $groups_id)
       {
         $op = "update";
         $contact['merge_vars']['new-email'] = $contact['email']['email'];
+      }
         if(
           $contact['#metadata']['is_deleted'] == 1 ||
           $contact['#metadata']['do_not_email'] == 1 ||
@@ -177,9 +178,7 @@ function mcsync_contacts($lists, $list_id, $groups_id)
         {
           $op = "delete";
         }
-      }
     }
-
     if ($op != "skip")
     {
       $ops[] = array("mcsync_batch_op", array($op, $blob, $contact, $list_id));
